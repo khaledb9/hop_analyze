@@ -1,85 +1,125 @@
+#!/usr/bin/env python3
 import re
-import numpy as np
 import sys
 
-def parse_hopping_data(filename):
-    with open(filename, 'r') as file:
-        content = file.read()
+HEADER_RE = re.compile(
+    r'^Hopping\s+<a\|H\|b>\s+between\s+(?P<pair>.+?)\s+in\s+sphere\s+#\s*(?P<sphere>\d+)'
+    r'\s+with\s+radius\s+(?P<radius>[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?)'
+    r'(?:\s+--\s*(?P<idx>\d+):)?\s*$'
+)
+RADIUS_VEC_RE = re.compile(r'^\s*Radius\s+vector\s+is:\s*(.*)$')
+NUM_RE = re.compile(r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?')
 
-    # Split the content into blocks
-    blocks = content.split('--\n')
+def clean_pair_label(raw_pair: str) -> str:
+    s = re.sub(r'\s*\([^)]*\)', '', raw_pair)     # drop all “( … )”
+    s = re.sub(r'\s*<-->\s*', '<-->', s)          # normalize arrow spacing
+    return s.strip()
 
-    # Compile regex for extracting values and atoms
-    matrix_regex = re.compile(r'\((-?\d+\.\d+)\s*([+-]\s*\d+\.\d+)i\)')
-    atoms_regex = re.compile(r'between\s+(\w+\d+)\s*\(.*?\)\s*<-->\s*(\w+\d+)\s*\(.*?\)')
-    radius_regex = re.compile(r'radius\s+(\d+\.\d+)')
-    results = []
+def parse_blocks(lines):
+    """
+    Yields blocks with keys: pair, radius, matrix_lines.
+    Robust to: blank separators, lone '--', and back-to-back headers.
+    """
+    current = None
+    after_radius_vec = False
 
-    for block in blocks:
-        if not block.strip():
+    for raw in lines:
+        line = raw.rstrip("\n")
+
+        # If we see a new header, flush previous (if any)
+        m = HEADER_RE.match(line)
+        if m:
+            if current is not None and current['matrix_lines']:
+                yield current
+            current = {
+                'pair': clean_pair_label(m.group('pair').strip()),
+                'radius': float(m.group('radius')),
+                'matrix_lines': [],
+            }
+            after_radius_vec = False
             continue
 
-        # Find the atoms
-        atoms_match = atoms_regex.search(block)
-        if atoms_match:
-            atoms = f"{atoms_match.group(1)}-{atoms_match.group(2)}"
-            atom_pair = f"{atoms_match.group(1)}-{atoms_match.group(2)}"
-        else:
-            atoms = "Unknown"  # Default to Unknown if no match is found
-            atom_pair = "Unknown"
-            # Debugging: Print a message if atom pairs are not found
-            print(f"Atom pairs not found in block: {block}")
-
-        # Find the radius and decide the group
-        radius_match = radius_regex.search(block)
-        if radius_match:
-            radius = float(radius_match.group(1))
-        else:
-            # If radius is not found, skip this block
-            print(f"Radius not found in block: {block}")
+        if current is None:
             continue
 
-        if 1 <= radius <= 3.5:
-            group = '1NN'
-        elif 4 <= radius <= 5.9:
-            group = '2NN'
-        elif 6 <= radius <= 6.7:
-            group = '3NN'
-        elif radius <= 3:
-            group = 'On-Site'
+        if RADIUS_VEC_RE.match(line):
+            after_radius_vec = True
+            continue
+
+        # End block on blank / naked separator
+        if not line.strip() or line.strip() == '--':
+            if current['matrix_lines']:
+                yield current
+                current = None
+            continue
+
+        # Collect numeric matrix lines after the radius-vector marker
+        if after_radius_vec and NUM_RE.search(line):
+            current['matrix_lines'].append(line)
+
+    # Tail flush
+    if current is not None and current['matrix_lines']:
+        yield current
+
+def max_abs_from_lines(matrix_lines):
+    max_val = 0.0
+    for line in matrix_lines:
+        for s in NUM_RE.findall(line):
+            v = abs(float(s))
+            if v > max_val:
+                max_val = v
+    return max_val
+
+def group_by_distance(rows, gap=2.0, eps=1e-9):
+    """
+    rows: list[(pair:str, hop:float, dist:float)]
+    New group starts only if dist - last_dist > gap + eps
+    """
+    rows_sorted = sorted(rows, key=lambda r: r[2])
+    groups, cur, last_d = [], [], None
+    for r in rows_sorted:
+        d = r[2]
+        if last_d is None or (d - last_d) <= (gap + eps):
+            cur.append(r)
         else:
-            continue  # skip the blocks that do not fit any group criteria
-
-        # Find all matrix elements
-        elements = matrix_regex.findall(block)
-        max_abs_value = 0
-        max_phase = 0
-
-        # Calculate the max absolute value and corresponding phase
-        for elem in elements:
-            real_part = float(elem[0])
-            imag_part = float(re.sub(r'\s+', '', elem[1]))  # Remove spaces in the imaginary part
-            abs_value = np.abs(complex(real_part, imag_part))
-            phase = np.angle(complex(real_part, imag_part)) / np.pi
-            if abs_value > max_abs_value:
-                max_abs_value = abs_value
-                max_phase = phase
-
-        results.append((atoms, max_abs_value, max_phase, group, radius, atom_pair))
-
-    # Sort results by the group
-    results.sort(key=lambda x: ('1NN', '2NN', '3NN', 'On-Site').index(x[3]))
-    return results
+            if cur: groups.append(cur)
+            cur = [r]
+        last_d = d
+    if cur:
+        groups.append(cur)
+    return groups
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python script_name.py filename")
+        print(f"Usage: {sys.argv[0]} <input_file> [--gap FLOAT]")
         sys.exit(1)
-    filename = sys.argv[1]
-    result_list = parse_hopping_data(filename)
-    print("Atoms Pair     Max Abs Value (Hopping)    Phase              Group       Radius")
-    for atoms, value, phase, group, radius, atom_pair in result_list:
-        print(f"{atom_pair:<15} {value:.4f}                    {phase:.4f}π             {group}    {radius}")
 
-if __name__ == "__main__":
+    path = sys.argv[1]
+    gap = 2.0
+    if '--gap' in sys.argv:
+        try:
+            gap = float(sys.argv[sys.argv.index('--gap') + 1])
+        except Exception:
+            print("Invalid --gap value; using default 2.0", file=sys.stderr)
+
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        blocks = list(parse_blocks(f))
+
+    rows = []
+    for b in blocks:
+        rows.append((b['pair'], max_abs_from_lines(b['matrix_lines']), float(b['radius'])))
+
+    groups = group_by_distance(rows, gap=gap, eps=1e-9)
+
+    # Pretty print (3 columns, by your requested order)
+    for gi, grp in enumerate(groups, 1):
+        dmin, dmax = min(r[2] for r in grp), max(r[2] for r in grp)
+        print(f"=== Distance group {gi}  [{dmin:.6f} .. {dmax:.6f}] ===")
+        print(f"{'PAIR':40s}\t{'HOPPING':>12s}\t{'DISTANCE':>12s}")
+        # sort each group by distance, then by |hopping| desc
+        for pair, hop, dist in sorted(grp, key=lambda r: (r[2], -r[1])):
+            print(f"{pair:40s}\t{hop:12.6f}\t{dist:12.6f}")
+        print()
+
+if __name__ == '__main__':
     main()
